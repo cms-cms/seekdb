@@ -13,7 +13,6 @@ set ob_global_debug_sync = 'reset';
 
 connection conn_dml;
 drop table if exists cs_refresh_guard;
-drop table if exists cs_refresh_numbers;
 call DBMS_AI_SERVICE.CREATE_AI_MODEL(
   'cs_refresh_embed', '{
     "type": "dense_embedding",
@@ -36,46 +35,25 @@ create table cs_refresh_guard(
           sync_mode=async, sync_interval=20s)
 );
 
-# Materialize 64 source rows before the guarded transaction.  The later
-# INSERT ... SELECT builds about 256 KiB of deterministic, low-compressibility
-# text from SHA-256 fragments.  This keeps the redo record bounded while still
-# crossing the 16 KiB transaction private-buffer threshold after compression.
-# A repeated-character payload compresses below that threshold, while a LOB
-# payload only flushes redo for the auxiliary LOB table, which ChangeStream
-# intentionally ignores for this unresolved-transaction check.
-create table cs_refresh_numbers(id bigint primary key);
-insert into cs_refresh_numbers values (0);
-insert into cs_refresh_numbers select id + 1 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 2 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 4 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 8 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 16 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 32 from cs_refresh_numbers;
-
 connection conn_sys;
 let $wait_timeout = 60;
 let $wait_condition =
   select PENDING_TX_COUNT = 0 and REFRESH_SCN > 0
   from oceanbase.DBA_OB_CHANGE_STREAM_REFRESH_STAT;
 --source include/wait_condition.inc
+# Force this one guarded write to submit redo before commit.  This existing
+# transaction test point avoids depending on payload compression or the
+# private-buffer threshold, and is disabled before the final commit starts.
+alter system set_tp tp_name = "TX_FORCE_WRITE_CLOG", error_code = 4023, frequency = 1;
 
 connection conn_dml;
-set session group_concat_max_len = 8192;
 start transaction;
-set session ob_query_timeout = 120000000;
-insert into cs_refresh_guard
-select n.id + 2,
-       group_concat(sha2(concat(n.id, ':', s.id), 256)
-                    order by s.id separator '')
-from cs_refresh_numbers n
-cross join cs_refresh_numbers s
-group by n.id;
-# Advance the statement sequence once more so the preceding callbacks become
-# eligible for the private-buffer flush.  Keeping the large write and this
-# boundary write separate makes the early redo deterministic without relying
-# on the 32 MiB in-statement overflow guard.
-insert into cs_refresh_guard values (66, 'redo boundary row');
-# The bounded inline base-table writes now force at least one early redo block.
+insert into cs_refresh_guard values (2, 'pending user dml');
+
+connection conn_sys;
+alter system set_tp tp_name = "TX_FORCE_WRITE_CLOG", error_code = 4023, frequency = 0;
+
+connection conn_dml;
 # Pause only this client transaction after its commit version is assigned but
 # before its commit log is submitted.  CSFetcher remains runnable and must
 # retain the unresolved user-DML transaction behind the watermark.
@@ -117,10 +95,9 @@ let $wait_condition =
 connection conn_dml;
 --enable_query_log
 --echo unresolved user DML kept behind refresh watermark
-select count(*) as committed_rows from cs_refresh_guard where id between 2 and 66;
+select count(*) as committed_rows from cs_refresh_guard where id = 2;
 --disable_query_log
 drop table cs_refresh_guard;
-drop table cs_refresh_numbers;
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('cs_refresh_endpoint');
 call DBMS_AI_SERVICE.DROP_AI_MODEL('cs_refresh_embed');
 disconnect conn_dml;
