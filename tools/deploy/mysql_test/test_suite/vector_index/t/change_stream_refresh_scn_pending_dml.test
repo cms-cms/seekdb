@@ -29,18 +29,18 @@ let $wait_condition =
   from oceanbase.DBA_OB_CHANGE_STREAM_REFRESH_STAT;
 --source include/wait_condition.inc
 
-# Pause a local transaction after the transaction service has assigned its
-# commit version but before it submits the commit log.  The large redo has
-# already been submitted separately and must be visible to ChangeStream.
-set ob_global_debug_sync =
-  'CS_TX_AFTER_GENERATE_COMMIT_VERSION wait_for cs_commit_continue execute 1';
-
 connection conn_dml;
 start transaction;
+set session ob_query_timeout = 120000000;
 insert into cs_refresh_guard values
   (2, repeat('a', 1048576), '[1,1,1]'),
   (3, repeat('b', 1048576), '[2,2,2]'),
   (4, repeat('c', 1048576), '[3,3,3]');
+# Pause only this client transaction after the transaction service has
+# assigned its commit version but before it submits the commit log.  The large
+# redo has already been submitted separately and is visible to ChangeStream.
+set debug_sync =
+  'CS_TX_AFTER_GENERATE_COMMIT_VERSION wait_for cs_commit_continue execute 1';
 send commit;
 
 connection conn_sys;
@@ -60,13 +60,13 @@ if ($refresh_scn_before != $refresh_scn_after)
   die ChangeStream refresh SCN advanced past unresolved user DML;
 }
 
-set ob_global_debug_sync = 'now signal cs_commit_continue';
+set debug_sync = 'now signal cs_commit_continue';
 
 connection conn_dml;
 reap;
+set debug_sync = 'CS_TX_AFTER_GENERATE_COMMIT_VERSION clear';
 
 connection conn_sys;
-set ob_global_debug_sync = 'CS_TX_AFTER_GENERATE_COMMIT_VERSION clear';
 set ob_global_debug_sync = 'reset';
 let $wait_timeout = 60;
 let $wait_condition =
