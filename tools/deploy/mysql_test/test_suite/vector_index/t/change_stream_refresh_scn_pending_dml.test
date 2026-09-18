@@ -39,15 +39,18 @@ let $wait_condition =
   select PENDING_TX_COUNT = 0 and REFRESH_SCN > 0
   from oceanbase.DBA_OB_CHANGE_STREAM_REFRESH_STAT;
 --source include/wait_condition.inc
+# Force each row write to submit real transaction redo before commit.  The
+# production default (16K) buffers this deliberately tiny test row, so neither
+# a sleep nor a minor freeze alone guarantees an unresolved redo record for
+# ChangeStream to consume.
+alter system set _private_buffer_size = '1B';
+real_sleep 1;
+
 connection conn_dml;
 start transaction;
 insert into cs_refresh_guard values (2, 'pending user dml');
 
 connection conn_sys;
-# A minor freeze forces the open transaction's row redo to durable log without
-# committing it.  This creates the real unresolved-DML state consumed by
-# ChangeStream without relying on payload size, compression, or debug hooks.
-alter system minor freeze;
 let $wait_timeout = 60;
 let $wait_condition =
   select PENDING_TX_COUNT > 0
@@ -68,6 +71,8 @@ connection conn_dml;
 commit;
 
 connection conn_sys;
+# Restore the production default before waiting or running another test case.
+alter system set _private_buffer_size = '16K';
 let $wait_timeout = 60;
 let $wait_condition =
   select PENDING_TX_COUNT = 0
