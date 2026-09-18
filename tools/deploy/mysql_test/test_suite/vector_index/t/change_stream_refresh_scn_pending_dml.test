@@ -15,7 +15,7 @@ create table cs_refresh_guard(
   id bigint primary key,
   embedding vector(3),
   vector index idx_cs_refresh_guard(embedding)
-    with (distance=l2, type=hnsw, sync_mode=async, sync_interval=20s)
+    with (distance=l2, type=hnsw, sync_mode=async)
 ) organization heap;
 
 connection conn_sys;
