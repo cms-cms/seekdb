@@ -10,7 +10,9 @@ connection conn_sys;
 alter system set vector_memory_limit = 0;
 
 connection conn_dml;
+--disable_warnings
 drop table if exists cs_refresh_guard;
+--enable_warnings
 create table cs_refresh_guard(
   id bigint primary key,
   embedding vector(3),
