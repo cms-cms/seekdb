@@ -70,7 +70,12 @@ select n.id + 2,
 from cs_refresh_numbers n
 cross join cs_refresh_numbers s
 group by n.id;
-# The bounded inline base-table writes force at least one early redo block.
+# Advance the statement sequence once more so the preceding callbacks become
+# eligible for the private-buffer flush.  Keeping the large write and this
+# boundary write separate makes the early redo deterministic without relying
+# on the 32 MiB in-statement overflow guard.
+insert into cs_refresh_guard values (66, 'redo boundary row');
+# The bounded inline base-table writes now force at least one early redo block.
 # Pause only this client transaction after its commit version is assigned but
 # before its commit log is submitted.  CSFetcher remains runnable and must
 # retain the unresolved user-DML transaction behind the watermark.
@@ -112,7 +117,7 @@ let $wait_condition =
 connection conn_dml;
 --enable_query_log
 --echo unresolved user DML kept behind refresh watermark
-select count(*) as committed_rows from cs_refresh_guard where id between 2 and 65;
+select count(*) as committed_rows from cs_refresh_guard where id between 2 and 66;
 --disable_query_log
 drop table cs_refresh_guard;
 drop table cs_refresh_numbers;
