@@ -234,13 +234,7 @@ int ObDDLService::fork_database(
     if (OB_SUCC(ret) && user_table_schemas.count() > 0) {
       bool need_wait = false;
       common::sqlclient::ObISQLConnection *iconn = trans.get_connection();
-      // Fork is a DDL operation.  Async index synchronization may take
-      // longer than the short internal-SQL timeout, especially when source
-      // tables have just received writes.  Keep this wait inside the request's
-      // DDL deadline instead of truncating it to internal_sql_execute_timeout.
-      const int64_t lock_timeout_us = THIS_WORKER.is_timeout_ts_valid()
-          ? THIS_WORKER.get_timeout_remain()
-          : GCONF._ob_ddl_timeout;
+      const int64_t lock_timeout_us = GCONF.internal_sql_execute_timeout;
       if (OB_ISNULL(iconn)) {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -316,7 +310,8 @@ int ObDDLService::fork_database(
                 empty_ddl_stmt_str, schema_guard, trans, allocator,
                 task_record,
                 need_fk_rebuild ? &table_id_map : nullptr,
-                need_fk_rebuild ? &dst_table_schemas_for_table : nullptr))) {
+                need_fk_rebuild ? &dst_table_schemas_for_table : nullptr,
+                true /* preserve_constraint_names */))) {
         } else if (OB_FAIL(task_records.push_back(task_record))) {
         } else if (need_fk_rebuild && OB_FAIL(all_dst_table_schemas.push_back(dst_table_schemas_for_table))) {
         }

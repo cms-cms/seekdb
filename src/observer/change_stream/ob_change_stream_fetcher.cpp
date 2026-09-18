@@ -282,7 +282,8 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 // ---------------------------------------------------------------------------
 // get_refresh_scn: get GTS, then decide refresh_scn based on async-index state:
 //   1. !has_async: return GTS — no async vector index tables.
-//   2. has_async && tx_info_ not empty: return OB_SUCCESS with invalid refresh_scn — worker handles.
+//   2. has_async && committed tx still in dispatcher: return OB_SUCCESS with
+//      invalid refresh_scn — worker handles.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= max_lsn:
 //      return GTS — no pending logs to consume.
 //   4. otherwise (including invalid current_lsn_): return current_scn_ —
@@ -309,8 +310,18 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     return ret;
   }
 
-  // Case 2: in-flight tx — worker will advance refresh_scn after draining; skip here.
-  if (!tx_info_.empty()) {
+  // Case 2: a committed tx already handed to the dispatcher must advance the
+  // watermark only after its async-index changes commit.  An uncommitted tx,
+  // however, must not block the current GTS: its eventual commit version is
+  // assigned after the GTS sampled above.  Treating every redo-only tx as a
+  // blocker can self-deadlock DDL such as FORK TABLE, whose table-lock
+  // transaction remains open while it waits for ChangeStream to catch up.
+  bool has_dispatched_tx = false;
+  for (common::hash::ObHashMap<int64_t, ObCSTxInfo *>::const_iterator it = tx_info_.begin();
+       !has_dispatched_tx && it != tx_info_.end(); ++it) {
+    has_dispatched_tx = OB_NOT_NULL(it->second) && it->second->commit_version_ > 0;
+  }
+  if (has_dispatched_tx) {
     return OB_SUCCESS;
   }
 
