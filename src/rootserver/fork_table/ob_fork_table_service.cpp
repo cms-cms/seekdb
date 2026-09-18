@@ -333,7 +333,14 @@ int ObDDLService::fork_table(const obcall::ObForkTableArg &fork_table_arg,
                                                  has_async_vec_index))) {
         } else if (has_async_vec_index) {
           common::sqlclient::ObISQLConnection *iconn = trans.get_connection();
-          const int64_t lock_timeout_us = GCONF.internal_sql_execute_timeout;
+          // Fork is a DDL operation.  Async index synchronization may take
+          // longer than the short internal-SQL timeout, especially when the
+          // source table has just received a batch of writes.  Keep this wait
+          // inside the request's DDL deadline instead of truncating it to
+          // internal_sql_execute_timeout.
+          const int64_t lock_timeout_us = THIS_WORKER.is_timeout_ts_valid()
+              ? THIS_WORKER.get_timeout_remain()
+              : GCONF._ob_ddl_timeout;
           if (OB_ISNULL(iconn)) {
             ret = OB_ERR_UNEXPECTED;
           } else if (OB_FAIL(transaction::tablelock::ObInnerConnectionLockUtil::lock_table(
