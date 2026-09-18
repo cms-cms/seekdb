@@ -8,6 +8,8 @@ connect (conn_dml,$OBMYSQL_MS0,root@sys,,test,$OBMYSQL_PORT);
 
 connection conn_sys;
 alter system set vector_memory_limit = 0;
+alter system set debug_sync_timeout = '100s';
+set ob_global_debug_sync = 'reset';
 
 connection conn_dml;
 drop table if exists cs_refresh_guard;
@@ -52,6 +54,12 @@ insert into cs_refresh_guard values
   (2, repeat('a', 1048576)),
   (3, repeat('b', 1048576)),
   (4, repeat('c', 1048576));
+# Pause only this client transaction after redo submission has been forced by
+# commit, but before its commit log is submitted.  CSFetcher remains runnable
+# and must retain the unresolved user-DML transaction behind the watermark.
+set debug_sync =
+  'CS_TX_AFTER_GENERATE_COMMIT_VERSION wait_for cs_commit_continue execute 1';
+send commit;
 
 connection conn_sys;
 let $wait_timeout = 60;
@@ -70,10 +78,14 @@ if ($refresh_scn_before != $refresh_scn_after)
   die ChangeStream refresh SCN advanced past unresolved user DML;
 }
 
+set debug_sync = 'now signal cs_commit_continue';
+
 connection conn_dml;
-commit;
+reap;
+set debug_sync = 'CS_TX_AFTER_GENERATE_COMMIT_VERSION clear';
 
 connection conn_sys;
+set ob_global_debug_sync = 'reset';
 let $wait_timeout = 60;
 let $wait_condition =
   select PENDING_TX_COUNT = 0
