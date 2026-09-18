@@ -11,26 +11,11 @@ alter system set vector_memory_limit = 0;
 
 connection conn_dml;
 drop table if exists cs_refresh_guard;
-call DBMS_AI_SERVICE.CREATE_AI_MODEL(
-  'cs_refresh_embed', '{
-    "type": "dense_embedding",
-    "model_name": "bge-M3"
-  }');
-call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(
-  'cs_refresh_endpoint', '{
-    "ai_model_name": "cs_refresh_embed",
-    "scope": "all",
-    "url": "http://127.0.0.1:1/unused",
-    "access_key": "unused",
-    "request_model_name": "bge-M3",
-    "provider": "openai"
-  }');
 create table cs_refresh_guard(
   id bigint primary key,
-  document varchar(4096),
-  vector index idx_cs_refresh_guard(document)
-    with (distance=l2, type=hnsw, model=cs_refresh_embed, dim=1024,
-          sync_mode=async, sync_interval=20s)
+  embedding vector(3),
+  vector index idx_cs_refresh_guard(embedding)
+    with (distance=l2, type=hnsw, sync_mode=async, sync_interval=20s)
 );
 
 connection conn_sys;
@@ -48,7 +33,7 @@ real_sleep 1;
 
 connection conn_dml;
 start transaction;
-insert into cs_refresh_guard values (2, 'pending user dml');
+insert into cs_refresh_guard values (2, '[1,2,3]');
 
 connection conn_sys;
 let $wait_timeout = 60;
@@ -85,8 +70,6 @@ connection conn_dml;
 select count(*) as committed_rows from cs_refresh_guard where id = 2;
 --disable_query_log
 drop table cs_refresh_guard;
-call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('cs_refresh_endpoint');
-call DBMS_AI_SERVICE.DROP_AI_MODEL('cs_refresh_embed');
 disconnect conn_dml;
 disconnect conn_sys;
 --enable_query_log
