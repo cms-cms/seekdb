@@ -30,17 +30,18 @@ call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(
   }');
 create table cs_refresh_guard(
   id bigint primary key,
-  document varchar(8192),
+  document varchar(4096),
   vector index idx_cs_refresh_guard(document)
     with (distance=l2, type=hnsw, model=cs_refresh_embed, dim=1024,
           sync_mode=async, sync_interval=20s)
 );
 
-# Materialize 8192 source rows before the guarded transaction.  The later
-# INSERT ... SELECT writes more than the transaction pending-redo threshold
-# into the async-index base table itself.  Using a LOB payload here would only
-# flush redo for the auxiliary LOB table, which ChangeStream intentionally
-# ignores when deciding whether this async-index transaction is unresolved.
+# Materialize 64 source rows before the guarded transaction.  The later
+# INSERT ... SELECT writes about 256 KiB into the async-index base table,
+# comfortably above the 16 KiB transaction private-buffer threshold without
+# making ChangeStream deserialize a needlessly large redo record.  Using a LOB
+# payload here would only flush redo for the auxiliary LOB table, which
+# ChangeStream intentionally ignores for this unresolved-transaction check.
 create table cs_refresh_numbers(id bigint primary key);
 insert into cs_refresh_numbers values (0);
 insert into cs_refresh_numbers select id + 1 from cs_refresh_numbers;
@@ -49,13 +50,6 @@ insert into cs_refresh_numbers select id + 4 from cs_refresh_numbers;
 insert into cs_refresh_numbers select id + 8 from cs_refresh_numbers;
 insert into cs_refresh_numbers select id + 16 from cs_refresh_numbers;
 insert into cs_refresh_numbers select id + 32 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 64 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 128 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 256 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 512 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 1024 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 2048 from cs_refresh_numbers;
-insert into cs_refresh_numbers select id + 4096 from cs_refresh_numbers;
 
 connection conn_sys;
 let $wait_timeout = 60;
@@ -68,9 +62,9 @@ connection conn_dml;
 start transaction;
 set session ob_query_timeout = 120000000;
 insert into cs_refresh_guard
-select id + 2, concat('pending async index row ', id, ' ', repeat('x', 8000))
+select id + 2, concat('pending async index row ', id, ' ', repeat('x', 4000))
 from cs_refresh_numbers;
-# The large inline base-table writes force at least one early redo block.
+# The bounded inline base-table writes force at least one early redo block.
 # Pause only this client transaction after its commit version is assigned but
 # before its commit log is submitted.  CSFetcher remains runnable and must
 # retain the unresolved user-DML transaction behind the watermark.
@@ -112,7 +106,7 @@ let $wait_condition =
 connection conn_dml;
 --enable_query_log
 --echo unresolved user DML kept behind refresh watermark
-select count(*) as committed_rows from cs_refresh_guard where id between 2 and 8193;
+select count(*) as committed_rows from cs_refresh_guard where id between 2 and 65;
 --disable_query_log
 drop table cs_refresh_guard;
 drop table cs_refresh_numbers;
