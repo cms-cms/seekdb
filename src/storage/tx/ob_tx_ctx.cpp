@@ -30,7 +30,6 @@
 #include "logservice/ob_log_service.h"
 #include "storage/tx/ob_tx_log_operator.h"
 #include "storage/tx/ob_tx_print_time_guard.h"
-#include "share/ob_debug_sync.h"
 
 namespace oceanbase {
 
@@ -5605,10 +5604,6 @@ int ObTxCtx::do_local_commit_tx_()
     } else {
       TRANS_LOG(WARN, "generate commit version failed", KR(ret), K(*this));
     }
-  // Regression hook for the narrow window where redo is durable and visible
-  // to ChangeStream, but the transaction commit log is not submitted yet.
-  // It is inert unless a test explicitly enables this debug-sync action.
-  } else if (OB_FALSE_IT(DEBUG_SYNC(CS_TX_AFTER_GENERATE_COMMIT_VERSION))) {
   } else if (OB_FAIL(submit_log_impl_(ObTxLogType::TX_COMMIT_LOG))) {
     // log submitting will retry in handle_timeout
     int tmp_ret = OB_SUCCESS;
