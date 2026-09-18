@@ -13,7 +13,6 @@ set ob_global_debug_sync = 'reset';
 
 connection conn_dml;
 drop table if exists cs_refresh_guard;
-drop table if exists cs_async_marker;
 call DBMS_AI_SERVICE.CREATE_AI_MODEL(
   'cs_refresh_embed', '{
     "type": "dense_embedding",
@@ -28,16 +27,13 @@ call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(
     "request_model_name": "bge-M3",
     "provider": "openai"
   }');
-create table cs_async_marker(
-  id bigint primary key,
-  document varchar(100),
-  vector index idx_cs_async_marker(document)
-    with (distance=l2, type=hnsw, model=cs_refresh_embed, dim=1024,
-          sync_mode=async, sync_interval=20s)
-);
 create table cs_refresh_guard(
   id bigint primary key,
-  payload longtext
+  document varchar(100),
+  payload longtext,
+  vector index idx_cs_refresh_guard(document)
+    with (distance=l2, type=hnsw, model=cs_refresh_embed, dim=1024,
+          sync_mode=async, sync_interval=20s)
 );
 
 connection conn_sys;
@@ -51,12 +47,13 @@ connection conn_dml;
 start transaction;
 set session ob_query_timeout = 120000000;
 insert into cs_refresh_guard values
-  (2, repeat('a', 1048576)),
-  (3, repeat('b', 1048576)),
-  (4, repeat('c', 1048576));
-# Pause only this client transaction after redo submission has been forced by
-# commit, but before its commit log is submitted.  CSFetcher remains runnable
-# and must retain the unresolved user-DML transaction behind the watermark.
+  (2, NULL, repeat('a', 1048576)),
+  (3, NULL, repeat('b', 1048576)),
+  (4, NULL, repeat('c', 1048576));
+# The large writes force an early redo block for the async-indexed base table.
+# Pause only this client transaction after its commit version is assigned but
+# before its commit log is submitted.  CSFetcher remains runnable and must
+# retain the unresolved user-DML transaction behind the watermark.
 set debug_sync =
   'CS_TX_AFTER_GENERATE_COMMIT_VERSION wait_for cs_commit_continue execute 1';
 send commit;
@@ -98,7 +95,6 @@ connection conn_dml;
 select count(*) as committed_rows from cs_refresh_guard where id between 2 and 4;
 --disable_query_log
 drop table cs_refresh_guard;
-drop table cs_async_marker;
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('cs_refresh_endpoint');
 call DBMS_AI_SERVICE.DROP_AI_MODEL('cs_refresh_embed');
 disconnect conn_dml;
