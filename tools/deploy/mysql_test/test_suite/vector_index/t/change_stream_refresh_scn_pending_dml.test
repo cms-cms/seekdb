@@ -37,11 +37,12 @@ create table cs_refresh_guard(
 );
 
 # Materialize 64 source rows before the guarded transaction.  The later
-# INSERT ... SELECT writes about 256 KiB into the async-index base table,
-# comfortably above the 16 KiB transaction private-buffer threshold without
-# making ChangeStream deserialize a needlessly large redo record.  Using a LOB
-# payload here would only flush redo for the auxiliary LOB table, which
-# ChangeStream intentionally ignores for this unresolved-transaction check.
+# INSERT ... SELECT builds about 256 KiB of deterministic, low-compressibility
+# text from SHA-256 fragments.  This keeps the redo record bounded while still
+# crossing the 16 KiB transaction private-buffer threshold after compression.
+# A repeated-character payload compresses below that threshold, while a LOB
+# payload only flushes redo for the auxiliary LOB table, which ChangeStream
+# intentionally ignores for this unresolved-transaction check.
 create table cs_refresh_numbers(id bigint primary key);
 insert into cs_refresh_numbers values (0);
 insert into cs_refresh_numbers select id + 1 from cs_refresh_numbers;
@@ -59,11 +60,16 @@ let $wait_condition =
 --source include/wait_condition.inc
 
 connection conn_dml;
+set session group_concat_max_len = 8192;
 start transaction;
 set session ob_query_timeout = 120000000;
 insert into cs_refresh_guard
-select id + 2, concat('pending async index row ', id, ' ', repeat('x', 4000))
-from cs_refresh_numbers;
+select n.id + 2,
+       group_concat(sha2(concat(n.id, ':', s.id), 256)
+                    order by s.id separator '')
+from cs_refresh_numbers n
+cross join cs_refresh_numbers s
+group by n.id;
 # The bounded inline base-table writes force at least one early redo block.
 # Pause only this client transaction after its commit version is assigned but
 # before its commit log is submitted.  CSFetcher remains runnable and must
