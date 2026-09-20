@@ -234,7 +234,14 @@ int ObDDLService::fork_database(
     if (OB_SUCC(ret) && user_table_schemas.count() > 0) {
       bool need_wait = false;
       common::sqlclient::ObISQLConnection *iconn = trans.get_connection();
-      const int64_t lock_timeout_us = GCONF.internal_sql_execute_timeout;
+      // Fork is a DDL operation.  The first async index on a fresh
+      // embedded instance may need to activate ChangeStream before it can
+      // catch up.  Keep both the table locks and the catch-up wait inside
+      // the caller's DDL deadline instead of truncating them to the much
+      // shorter internal-SQL timeout.
+      const int64_t lock_timeout_us = THIS_WORKER.is_timeout_ts_valid()
+          ? THIS_WORKER.get_timeout_remain()
+          : GCONF._ob_ddl_timeout;
       if (OB_ISNULL(iconn)) {
         ret = OB_ERR_UNEXPECTED;
       }
