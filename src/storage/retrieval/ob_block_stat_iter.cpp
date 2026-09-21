@@ -827,7 +827,6 @@ int ObBlockStatIterator::shrink_scan_range(const ObDatumRowkey &start_key)
     LOG_WARN("failed to deep copy physical scan start key", K(ret), K(start_key));
   } else {
     curr_scan_range_.start_key_ = curr_scan_start_key_;
-    ret = prepare_memtable_scan_range(curr_scan_start_key_);
   }
   return ret;
 }
@@ -844,18 +843,24 @@ int ObBlockStatIterator::prepare_memtable_scan_range(const ObDatumRowkey &start_
   } else {
     const int64_t schema_rowkey_cnt = rowkey_read_info_->get_schema_rowkey_count();
     ObDatumRowkey new_start_key = start_key;
-    if (!start_key.is_min_rowkey() && !start_key.is_max_rowkey()) {
+    const bool is_ext_rowkey = start_key.is_min_rowkey() || start_key.is_max_rowkey();
+    if (OB_UNLIKELY(!is_ext_rowkey && start_key.get_datum_cnt() < schema_rowkey_cnt)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("physical scan start key has fewer datums than schema rowkey",
+          K(ret), K(start_key), K(schema_rowkey_cnt));
+    } else if (!is_ext_rowkey) {
       // A memtable range only accepts the logical schema rowkey.  SSTable
       // block boundaries may additionally carry multi-version columns.
-      new_start_key.datum_cnt_ = MIN(schema_rowkey_cnt, start_key.get_datum_cnt());
+      new_start_key.datum_cnt_ = schema_rowkey_cnt;
     }
-    if (OB_FAIL(new_start_key.deep_copy(memtable_scan_start_key_, memtable_scan_start_key_allocator_))) {
+    if (OB_SUCC(ret)
+        && OB_FAIL(new_start_key.deep_copy(memtable_scan_start_key_, memtable_scan_start_key_allocator_))) {
       LOG_WARN("failed to deep copy memtable scan start key", K(ret), K(start_key));
-    } else if (!start_key.is_min_rowkey() && !start_key.is_max_rowkey()
+    } else if (OB_SUCC(ret) && !is_ext_rowkey
         && OB_FAIL(memtable_scan_start_key_.prepare_memtable_readable(
             rowkey_read_info_->get_columns_desc(), memtable_scan_start_key_allocator_))) {
       LOG_WARN("failed to prepare memtable readable", K(ret), K(memtable_scan_start_key_));
-    } else {
+    } else if (OB_SUCC(ret)) {
       memtable_scan_range_.start_key_ = memtable_scan_start_key_;
     }
   }
