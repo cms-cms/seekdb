@@ -34,8 +34,7 @@ public:
   virtual ~ObIChangeStreamService() = default;
   virtual int wait_until_refreshed(
       common::ObMySQLProxy &mysql_proxy,
-      int64_t timeout_us,
-      int64_t exempt_tx_id) = 0;
+      int64_t timeout_us) = 0;
 };
 
 } // namespace query

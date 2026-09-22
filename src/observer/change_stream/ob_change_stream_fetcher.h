@@ -24,7 +24,6 @@
 #include "lib/ob_define.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/hash/ob_hashmap.h"
-#include "lib/lock/ob_spin_lock.h"
 #include "common/ob_tablet_id.h"
 #include "share/scn.h"
 #include "share/ob_thread_pool.h"
@@ -146,15 +145,12 @@ public:
 
   /// For change_stream_refresh_scn:
   /// - no async table: returns GTS
-  /// - async table with an in-flight tx or committed dispatched tx: returns
-  ///   invalid SCN (skip this round)
-  /// - a FORK caller may temporarily exempt only its own table-lock tx while
-  ///   waiting for the watermark, avoiding a wait-on-self cycle
+  /// - async table with a committed dispatched tx: returns invalid SCN (skip
+  ///   this round); redo-only/open transactions cannot commit below the GTS
+  ///   already sampled for this refresh round
   /// - otherwise returns GTS only when current_lsn catches up; returns
   ///   current_scn while logs are still being consumed.
   int get_refresh_scn(SCN &refresh_scn);
-  int add_refresh_scn_exempt_tx(int64_t tx_id);
-  int remove_refresh_scn_exempt_tx(int64_t tx_id);
   /// For log reclaim: returns the minimum LSN still depended on by in-flight tx.
   palf::LSN get_min_dep_lsn() const;
 
@@ -196,7 +192,6 @@ private:
   int extract_ddl_schema_version_(ObCSTxInfo *tx, int64_t &schema_version);
   /// Get or create tx in tx_info_; used by handle_redo_log_ and MDS DDL branch.
   int get_or_create_tx_info_(int64_t tid, const palf::LSN &lsn, ObCSTxInfo *&tx);
-  bool is_refresh_scn_exempt_tx_(int64_t tx_id);
 
   bool is_inited_;
   ObCSDispatcher *dispatcher_;
@@ -206,8 +201,6 @@ private:
   SCN current_scn_;
   int64_t current_schema_version_;
   common::hash::ObHashMap<int64_t, ObCSTxInfo *> tx_info_; // tx_id -> ObCSTxInfo
-  common::ObSpinLock refresh_scn_exempt_tx_lock_;
-  common::ObSEArray<int64_t, 4> refresh_scn_exempt_tx_ids_;
   int64_t total_tx_committed_;
   RunningMode running_mode_;           // IDLE: no async-index tables; ACTIVE: consuming logs.
   bool has_async_index_tables_;        // Cached result of check_has_async_index_tables_().

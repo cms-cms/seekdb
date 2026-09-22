@@ -125,26 +125,19 @@ void ObChangeStreamMgr::destroy()
 
 int ObChangeStreamMgr::wait_refresh_scn(
     common::ObISQLClient &sql_client,
-    const int64_t timeout_us,
-    const int64_t exempt_tx_id)
+    const int64_t timeout_us)
 {
   UNUSED(sql_client);
   int ret = common::OB_SUCCESS;
   SCN safe_visible_scn;
   const int64_t SLEEP_INTERVAL_US = 100 * 1000; // 100ms
   const int64_t abs_timeout_us = ObTimeUtility::current_time() + timeout_us;
-  ObChangeStreamMgr *mgr =
-      ::oceanbase::share::server_service<::oceanbase::share::ObChangeStreamMgr>();
-  bool exempt_tx_registered = false;
 
-  if (OB_ISNULL(mgr) || !mgr->is_inited()) {
-    ret = OB_NOT_INIT;
-  } else if (exempt_tx_id > 0
-             && OB_FAIL(mgr->fetcher_.add_refresh_scn_exempt_tx(exempt_tx_id))) {
-  } else if (FALSE_IT(exempt_tx_registered = exempt_tx_id > 0)) {
-  } else if (OB_FAIL(OB_TS_MGR.get_gts_sync(abs_timeout_us - ObTimeUtility::current_time(),
-                                           safe_visible_scn))) {
+  if (OB_FAIL(OB_TS_MGR.get_gts_sync(abs_timeout_us - ObTimeUtility::current_time(),
+                                    safe_visible_scn))) {
   } else {
+    ObChangeStreamMgr *mgr =
+        ::oceanbase::share::server_service<::oceanbase::share::ObChangeStreamMgr>();
     bool is_satisfied = false;
     while (OB_SUCC(ret) && !is_satisfied) {
       SCN current_refresh_scn;
@@ -152,6 +145,8 @@ int ObChangeStreamMgr::wait_refresh_scn(
       ObCSDispatcher *dispatcher = (OB_NOT_NULL(mgr) ? &mgr->dispatcher_ : nullptr);
       if (now >= abs_timeout_us) {
         ret = OB_TIMEOUT;
+      } else if (OB_ISNULL(mgr) || !mgr->is_inited()) {
+        ret = OB_NOT_INIT;
       } else if (OB_FAIL(current_refresh_scn.convert_for_tx(
                      dispatcher->get_refresh_scn()))) {
       } else if (current_refresh_scn >= safe_visible_scn) {
@@ -162,16 +157,6 @@ int ObChangeStreamMgr::wait_refresh_scn(
         LOG_INFO("waiting for change stream refresh scn",
                  K(safe_visible_scn), K(current_refresh_scn));
         ob_usleep(SLEEP_INTERVAL_US);
-      }
-    }
-  }
-  if (exempt_tx_registered) {
-    const int tmp_ret = mgr->fetcher_.remove_refresh_scn_exempt_tx(exempt_tx_id);
-    if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN("failed to unregister refresh scn exempt transaction",
-               K(tmp_ret), K(exempt_tx_id));
-      if (OB_SUCC(ret)) {
-        ret = tmp_ret;
       }
     }
   }

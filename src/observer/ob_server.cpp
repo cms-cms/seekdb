@@ -347,11 +347,9 @@ storage::ObIVectorIndexRuntime *ObServer::vector_index_runtime()
 
 int ObServer::wait_until_refreshed(
     common::ObMySQLProxy &mysql_proxy,
-    const int64_t timeout_us,
-    const int64_t exempt_tx_id)
+    const int64_t timeout_us)
 {
-  return share::ObChangeStreamMgr::wait_refresh_scn(
-      mysql_proxy, timeout_us, exempt_tx_id);
+  return share::ObChangeStreamMgr::wait_refresh_scn(mysql_proxy, timeout_us);
 }
 } // namespace observer
 } // namespace oceanbase

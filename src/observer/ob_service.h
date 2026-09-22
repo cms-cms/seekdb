@@ -155,8 +155,7 @@ public:
   int check_server_empty(bool &server_empty) override;
   int wait_until_change_stream_refreshed(
       common::ObMySQLProxy &mysql_proxy,
-      int64_t timeout_us,
-      int64_t exempt_tx_id) override;
+      int64_t timeout_us) override;
 
 private:
   int inner_fill_tablet_info_(

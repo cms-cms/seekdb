@@ -22,11 +22,9 @@
 #include "rootserver/ob_ddl_service.h"
 #include "rootserver/fork_table/ob_fork_table_util.h"
 #include "rootserver/ob_rootserver_local_runtime.h"
-#include "observer/ob_inner_sql_connection.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "storage/ddl/ob_ddl_lock.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
-#include "storage/tx/ob_trans_define.h"
 
 namespace oceanbase {
 using namespace common;
@@ -236,7 +234,12 @@ int ObDDLService::fork_database(
     if (OB_SUCC(ret) && user_table_schemas.count() > 0) {
       bool need_wait = false;
       common::sqlclient::ObISQLConnection *iconn = trans.get_connection();
-      const int64_t lock_timeout_us = GCONF.internal_sql_execute_timeout;
+      // Keep both the source-table locks and ChangeStream catch-up inside the
+      // caller's DDL deadline.  The internal-SQL timeout is shorter than the
+      // embedded FORK operation and can otherwise surface as a false 4012.
+      const int64_t lock_timeout_us = THIS_WORKER.is_timeout_ts_valid()
+          ? THIS_WORKER.get_timeout_remain()
+          : GCONF._ob_ddl_timeout;
       if (OB_ISNULL(iconn)) {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -260,21 +263,10 @@ int ObDDLService::fork_database(
       }
       if (OB_SUCC(ret) && need_wait) {
         ObIRootserverLocalRuntime *local_runtime = rootserver_local_runtime();
-        observer::ObInnerSQLConnection *inner_conn =
-            static_cast<observer::ObInnerSQLConnection *>(iconn);
-        transaction::ObTxDesc *tx_desc = nullptr;
-        int64_t exempt_tx_id = 0;
         if (OB_ISNULL(local_runtime)) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_ISNULL(inner_conn)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_ISNULL(tx_desc = inner_conn->get_session().get_tx_desc())) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (FALSE_IT(exempt_tx_id = tx_desc->get_tx_id().get_id())) {
-        } else if (exempt_tx_id <= 0) {
-          ret = OB_ERR_UNEXPECTED;
         } else if (OB_FAIL(local_runtime->wait_until_change_stream_refreshed(
-                       get_sql_proxy(), lock_timeout_us, exempt_tx_id))) {
+                       get_sql_proxy(), lock_timeout_us))) {
         } else {
           LOG_INFO("async index sync completed before fork database snapshot");
         }

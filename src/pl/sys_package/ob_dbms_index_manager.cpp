@@ -49,7 +49,7 @@ int ObDBMSIndexManager::refresh(
   } else if (OB_ISNULL(change_stream)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(change_stream->wait_until_refreshed(
-                 *mysql_proxy, timeout_us, 0 /* exempt_tx_id */))) {
+                 *mysql_proxy, timeout_us))) {
   }
   return ret;
 }
