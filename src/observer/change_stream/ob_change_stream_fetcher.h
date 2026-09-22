@@ -147,8 +147,8 @@ public:
 
   /// For change_stream_refresh_scn:
   /// - no async table: returns GTS
-  /// - async table with unresolved user DML or committed dispatched tx: returns
-  ///   invalid SCN (skip advancing this round)
+  /// - async table with user DML already committed at/before the sampled GTS,
+  ///   or committed dispatched tx: returns invalid SCN (skip this round)
   /// - lock/metadata-only open tx does not block the watermark
   /// - otherwise returns GTS only when current_lsn catches up; returns
   ///   current_scn while logs are still being consumed.

@@ -25,7 +25,9 @@
 #include "observer/change_stream/ob_change_stream_mgr.h"
 #include "share/ob_global_stat_proxy.h"
 #include "storage/tx/ob_tx_log.h"
+#include "storage/tx/ob_tx_data_define.h"
 #include "storage/tx/ob_multi_data_source.h"
+#include "storage/tx_table/ob_tx_table_interface.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -335,8 +337,9 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 // ---------------------------------------------------------------------------
 // get_refresh_scn: get GTS, then decide refresh_scn based on async-index state:
 //   1. !has_async: return GTS — no async vector index tables.
-//   2. has_async && unresolved user DML or committed tx still in dispatcher:
-//      return OB_SUCCESS with invalid refresh_scn — commit/worker handles.
+//   2. has_async && user DML already committed at/before this refresh round,
+//      or committed tx still in dispatcher: return OB_SUCCESS with invalid
+//      refresh_scn — Fetcher/Worker handles.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= max_lsn:
 //      return GTS — no pending logs to consume.
 //   4. otherwise (including invalid current_lsn_): return current_scn_ —
@@ -364,17 +367,57 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
   }
 
   // Case 2: committed DML handed to Dispatcher blocks until Worker commits.
-  // Unresolved user DML also blocks because commit_version_ == 0 only means
-  // Fetcher has not consumed its commit log; the transaction service may
-  // already have assigned a commit version.  Advancing past such a transaction
-  // could make Dispatcher skip its async-index changes.  Only an open
-  // transaction proven to contain no user-table DML (for example FORK TABLE's
-  // table-lock/metadata redo) is safe to ignore here.
+  // For redo-only user DML, consult the transaction table instead of treating
+  // commit_version_ == 0 as committed.  A transaction that is still RUNNING
+  // after the GTS sampled above cannot later commit below that GTS, so it is
+  // safe for this refresh round and must not make FORK wait on its own open
+  // transaction.  A transaction already recorded as COMMIT must keep blocking
+  // until Fetcher consumes its commit log and Dispatcher applies the async
+  // index changes.  Unknown lookup results stay conservative and block.
   bool has_blocking_tx = false;
+  storage::ObLS *ls = nullptr;
+  storage::ObTxTableGuard tx_table_guard;
+  if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObLSService>()->get_ls(ls))) {
+    return ret;
+  } else if (OB_ISNULL(ls) || OB_ISNULL(ls->get_tx_table())) {
+    ret = OB_ERR_UNEXPECTED;
+    return ret;
+  } else if (OB_FAIL(ls->get_tx_table()->get_tx_table_guard(tx_table_guard))) {
+    return ret;
+  }
   for (common::hash::ObHashMap<int64_t, ObCSTxInfo *>::const_iterator it = tx_info_.begin();
        !has_blocking_tx && it != tx_info_.end(); ++it) {
-    has_blocking_tx = OB_NOT_NULL(it->second)
-        && (it->second->commit_version_ > 0 || it->second->has_user_dml_);
+    const ObCSTxInfo *tx = it->second;
+    if (OB_ISNULL(tx)) {
+    } else if (tx->commit_version_ > 0) {
+      has_blocking_tx = true;
+    } else if (tx->has_user_dml_) {
+      int64_t tx_state = storage::ObTxData::RUNNING;
+      SCN trans_version;
+      SCN recycled_scn;
+      const int state_ret = tx_table_guard.try_get_tx_state(
+          transaction::ObTransID(tx->tx_id_), tx_state, trans_version, recycled_scn);
+      if (OB_SUCCESS == state_ret) {
+        if (storage::ObTxData::RUNNING == tx_state
+            || storage::ObTxData::ELR_COMMIT == tx_state
+            || storage::ObTxData::ABORT == tx_state) {
+          has_blocking_tx = false;
+        } else if (storage::ObTxData::COMMIT == tx_state) {
+          has_blocking_tx = trans_version <= gts_scn;
+        } else {
+          has_blocking_tx = true;
+          LOG_WARN("CSFetcher: unexpected unresolved user DML state",
+                   K(tx_state), K(tx->tx_id_), K(trans_version), K(gts_scn));
+        }
+      } else {
+        has_blocking_tx = true;
+        if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+          LOG_WARN("CSFetcher: failed to determine unresolved user DML state",
+                   K(state_ret), K(tx->tx_id_), K(tx->start_lsn_),
+                   K(trans_version), K(recycled_scn));
+        }
+      }
+    }
   }
   if (has_blocking_tx) {
     return OB_SUCCESS;
