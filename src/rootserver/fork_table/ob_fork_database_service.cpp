@@ -26,6 +26,7 @@
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "storage/ddl/ob_ddl_lock.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
+#include "storage/tx/ob_trans_define.h"
 
 namespace oceanbase {
 using namespace common;
