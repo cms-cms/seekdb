@@ -27,7 +27,6 @@
 #include "storage/tx/ob_tx_log.h"
 #include "storage/tx/ob_tx_data_define.h"
 #include "storage/tx/ob_multi_data_source.h"
-#include "storage/tx_table/ob_tx_table_interface.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -49,59 +48,6 @@ namespace oceanbase
 namespace share
 {
 
-// Conservatively identify redo that may affect a user table.  ChangeStream
-// must keep an unresolved user-DML transaction behind the refresh watermark:
-// the transaction service may already have assigned its commit version even
-// though Fetcher has not consumed the commit log yet.  Lock/metadata-only
-// redo, on the other hand, cannot produce async-index rows and must not make a
-// DDL transaction such as FORK TABLE wait on itself.
-static bool redo_may_contain_user_dml(const char *buf, const int64_t buf_len)
-{
-  bool may_contain_user_dml = true;
-  int ret = OB_SUCCESS;
-  int64_t pos = 0;
-  memtable::ObMemtableMutatorMeta meta;
-
-  if (OB_ISNULL(buf) || buf_len <= 0) {
-  } else if (OB_FAIL(meta.deserialize(buf, buf_len, pos))) {
-  } else {
-    may_contain_user_dml = false;
-    while (OB_SUCC(ret) && pos < buf_len && !may_contain_user_dml) {
-      memtable::ObMutatorRowHeader row_header;
-      if (OB_FAIL(row_header.deserialize(buf, buf_len, pos))) {
-        may_contain_user_dml = true;
-      } else {
-        const int64_t row_payload_start = pos;
-        const bool is_data_row =
-            row_header.mutator_type_ == memtable::MutatorType::MUTATOR_ROW
-            || row_header.mutator_type_ == memtable::MutatorType::MUTATOR_ROW_EXT_INFO;
-        const uint64_t tablet_id = row_header.tablet_id_.id();
-        if (is_data_row
-            && tablet_id >= OB_MAX_INNER_TABLE_ID
-            && tablet_id <= ObTabletID::MAX_USER_TABLET_ID) {
-          may_contain_user_dml = true;
-        } else {
-          // Every mutator entry starts with its encoded length.  We only need
-          // to locate the next entry; Dispatcher performs full deserialization
-          // after commit.
-          int32_t entry_len = 0;
-          if (OB_FAIL(common::serialization::decode_i32(buf, buf_len, pos, &entry_len))) {
-            may_contain_user_dml = true;
-          } else {
-            const int64_t next_pos = row_payload_start + static_cast<int64_t>(entry_len);
-            if (entry_len <= 0 || next_pos <= row_payload_start || next_pos > buf_len) {
-              may_contain_user_dml = true;
-            } else {
-              pos = next_pos;
-            }
-          }
-        }
-      }
-    }
-  }
-  return may_contain_user_dml;
-}
-
 ObCSFetcher::ObCSFetcher()
   : share::ObThreadPool(1),
     is_inited_(false),
@@ -111,6 +57,9 @@ ObCSFetcher::ObCSFetcher()
     current_lsn_(),
     current_scn_(),
     current_schema_version_(0),
+    tx_info_(),
+    refresh_scn_exempt_tx_lock_(),
+    refresh_scn_exempt_tx_ids_(),
     total_tx_committed_(0),
     running_mode_(IDLE),
     has_async_index_tables_(false),
@@ -264,6 +213,10 @@ void ObCSFetcher::destroy()
       }
     }
     tx_info_.destroy();
+    {
+      common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+      refresh_scn_exempt_tx_ids_.reset();
+    }
     dispatcher_ = nullptr;
     log_storage_ = nullptr;
     schema_publish_signal_ = nullptr;
@@ -337,9 +290,8 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 // ---------------------------------------------------------------------------
 // get_refresh_scn: get GTS, then decide refresh_scn based on async-index state:
 //   1. !has_async: return GTS — no async vector index tables.
-//   2. has_async && user DML already committed at/before this refresh round,
-//      or committed tx still in dispatcher: return OB_SUCCESS with invalid
-//      refresh_scn — Fetcher/Worker handles.
+//   2. has_async && a non-exempt tx is still in flight, or a committed tx is
+//      still in dispatcher: return OB_SUCCESS with invalid refresh_scn.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= max_lsn:
 //      return GTS — no pending logs to consume.
 //   4. otherwise (including invalid current_lsn_): return current_scn_ —
@@ -366,58 +318,16 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     return ret;
   }
 
-  // Case 2: committed DML handed to Dispatcher blocks until Worker commits.
-  // For redo-only user DML, consult both the live transaction-context table
-  // and the durable transaction-data table instead of treating
-  // commit_version_ == 0 as committed.  A transaction that is still RUNNING
-  // after the GTS sampled above cannot later commit below that GTS, so it is
-  // safe for this refresh round and must not make FORK wait behind the first
-  // async-index write.  A transaction already recorded as COMMIT must keep
-  // blocking until Fetcher consumes its commit log and Dispatcher applies the
-  // async-index changes.  Unknown lookup results stay conservative and block.
+  // Case 2: remain conservative for every in-flight transaction.  The only
+  // exception is the exact FORK transaction registered by wait_refresh_scn():
+  // it currently contains only the source-table SHARE lock (and possibly FORK
+  // metadata) and would otherwise make the wait depend on its own commit.
   bool has_blocking_tx = false;
-  storage::ObLS *ls = nullptr;
-  storage::ObTxTableGuard tx_table_guard;
-  if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObLSService>()->get_ls(ls))) {
-    return ret;
-  } else if (OB_ISNULL(ls) || OB_ISNULL(ls->get_tx_table())) {
-    ret = OB_ERR_UNEXPECTED;
-    return ret;
-  } else if (OB_FAIL(ls->get_tx_table()->get_tx_table_guard(tx_table_guard))) {
-    return ret;
-  }
   for (common::hash::ObHashMap<int64_t, ObCSTxInfo *>::const_iterator it = tx_info_.begin();
        !has_blocking_tx && it != tx_info_.end(); ++it) {
     const ObCSTxInfo *tx = it->second;
-    if (OB_ISNULL(tx)) {
-    } else if (tx->commit_version_ > 0) {
+    if (OB_NOT_NULL(tx) && !is_refresh_scn_exempt_tx_(tx->tx_id_)) {
       has_blocking_tx = true;
-    } else if (tx->has_user_dml_) {
-      int64_t tx_state = storage::ObTxData::RUNNING;
-      SCN trans_version;
-      const int state_ret = tx_table_guard.get_tx_state_with_scn(
-          transaction::ObTransID(tx->tx_id_), SCN::max_scn(),
-          tx_state, trans_version);
-      if (OB_SUCCESS == state_ret) {
-        if (storage::ObTxData::RUNNING == tx_state
-            || storage::ObTxData::ELR_COMMIT == tx_state
-            || storage::ObTxData::ABORT == tx_state) {
-          has_blocking_tx = false;
-        } else if (storage::ObTxData::COMMIT == tx_state) {
-          has_blocking_tx = trans_version <= gts_scn;
-        } else {
-          has_blocking_tx = true;
-          LOG_WARN("CSFetcher: unexpected unresolved user DML state",
-                   K(tx_state), K(tx->tx_id_), K(trans_version), K(gts_scn));
-        }
-      } else {
-        has_blocking_tx = true;
-        if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
-          LOG_WARN("CSFetcher: failed to determine unresolved user DML state",
-                   K(state_ret), K(tx->tx_id_), K(tx->start_lsn_),
-                   K(trans_version));
-        }
-      }
     }
   }
   if (has_blocking_tx) {
@@ -446,6 +356,46 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     refresh_scn = current_scn_;
   }
   return ret;
+}
+
+int ObCSFetcher::add_refresh_scn_exempt_tx(const int64_t tx_id)
+{
+  int ret = OB_SUCCESS;
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  if (tx_id <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(refresh_scn_exempt_tx_ids_.push_back(tx_id))) {
+    LOG_WARN("CSFetcher: failed to register refresh scn exempt transaction",
+             KR(ret), K(tx_id));
+  }
+  return ret;
+}
+
+int ObCSFetcher::remove_refresh_scn_exempt_tx(const int64_t tx_id)
+{
+  int ret = OB_SUCCESS;
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  bool found = false;
+  for (int64_t i = 0; !found && i < refresh_scn_exempt_tx_ids_.count(); ++i) {
+    if (refresh_scn_exempt_tx_ids_.at(i) == tx_id) {
+      found = true;
+      ret = refresh_scn_exempt_tx_ids_.remove(i);
+    }
+  }
+  if (!found) {
+    ret = OB_ENTRY_NOT_EXIST;
+  }
+  return ret;
+}
+
+bool ObCSFetcher::is_refresh_scn_exempt_tx_(const int64_t tx_id)
+{
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  bool found = false;
+  for (int64_t i = 0; !found && i < refresh_scn_exempt_tx_ids_.count(); ++i) {
+    found = refresh_scn_exempt_tx_ids_.at(i) == tx_id;
+  }
+  return found;
 }
 
 // get_has_async_cached_: use last_checked_schema_version_ / has_async_index_tables_; refresh cache when schema version changed.
@@ -704,7 +654,6 @@ int ObCSFetcher::handle_redo_log_(
   if (OB_FAIL(get_or_create_tx_info_(tid, lsn, tx))) {
     // error already logged
   } else if (OB_NOT_NULL(tx)) {
-    const bool may_contain_user_dml = redo_may_contain_user_dml(mutator_buf, mutator_size);
     char *buf = static_cast<char *>(common::ob_malloc(mutator_size, "CSRedoBuf"));
     if (OB_ISNULL(buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -717,8 +666,6 @@ int ObCSFetcher::handle_redo_log_(
       if (OB_FAIL(tx->redo_list_.push_back(rec))) {
         LOG_WARN("CSFetcher: fail to push redo record", KR(ret), K(tid));
         common::ob_free(buf);
-      } else {
-        tx->has_user_dml_ = tx->has_user_dml_ || may_contain_user_dml;
       }
     }
   }

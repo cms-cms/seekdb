@@ -24,6 +24,7 @@
 #include "lib/ob_define.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/hash/ob_hashmap.h"
+#include "lib/lock/ob_spin_lock.h"
 #include "common/ob_tablet_id.h"
 #include "share/scn.h"
 #include "share/ob_thread_pool.h"
@@ -97,7 +98,6 @@ struct ObCSTxInfo
   palf::LSN start_lsn_;           // Used by get_min_dep_lsn for log reclaim and init restart.
   int64_t   schema_version_ = 0;  // Assigned from Fetcher's current_schema_version_ at commit time.
   bool      is_ddl_ = false;      // True if redo contains __all_ddl_operation rows.
-  bool      has_user_dml_ = false; // True if redo may contain user-table DML rows.
   common::ObSEArray<ObCSRollbackRange, 1> rollback_list_;
   common::ObSEArray<ObCSRedoRecord, 1>    redo_list_;
   int64_t in_dispatch_time_ = 0;
@@ -109,7 +109,6 @@ struct ObCSTxInfo
     start_lsn_.reset();
     schema_version_ = 0;
     is_ddl_ = false;
-    has_user_dml_ = false;
     rollback_list_.reset();
     redo_list_.reset();
     in_dispatch_time_ = 0;
@@ -119,7 +118,7 @@ struct ObCSTxInfo
   void destroy();
 
   TO_STRING_KV(K_(tx_id), K_(commit_version), K_(start_lsn), K_(schema_version),
-               K_(is_ddl), K_(has_user_dml), K_(in_dispatch_time));
+               K_(is_ddl), K_(in_dispatch_time));
 };
 
 // ---------------------------------------------------------------------------
@@ -147,12 +146,15 @@ public:
 
   /// For change_stream_refresh_scn:
   /// - no async table: returns GTS
-  /// - async table with user DML already committed at/before the sampled GTS,
-  ///   or committed dispatched tx: returns invalid SCN (skip this round)
-  /// - lock/metadata-only open tx does not block the watermark
+  /// - async table with an in-flight tx or committed dispatched tx: returns
+  ///   invalid SCN (skip this round)
+  /// - a FORK caller may temporarily exempt only its own table-lock tx while
+  ///   waiting for the watermark, avoiding a wait-on-self cycle
   /// - otherwise returns GTS only when current_lsn catches up; returns
   ///   current_scn while logs are still being consumed.
   int get_refresh_scn(SCN &refresh_scn);
+  int add_refresh_scn_exempt_tx(int64_t tx_id);
+  int remove_refresh_scn_exempt_tx(int64_t tx_id);
   /// For log reclaim: returns the minimum LSN still depended on by in-flight tx.
   palf::LSN get_min_dep_lsn() const;
 
@@ -194,6 +196,7 @@ private:
   int extract_ddl_schema_version_(ObCSTxInfo *tx, int64_t &schema_version);
   /// Get or create tx in tx_info_; used by handle_redo_log_ and MDS DDL branch.
   int get_or_create_tx_info_(int64_t tid, const palf::LSN &lsn, ObCSTxInfo *&tx);
+  bool is_refresh_scn_exempt_tx_(int64_t tx_id);
 
   bool is_inited_;
   ObCSDispatcher *dispatcher_;
@@ -203,6 +206,8 @@ private:
   SCN current_scn_;
   int64_t current_schema_version_;
   common::hash::ObHashMap<int64_t, ObCSTxInfo *> tx_info_; // tx_id -> ObCSTxInfo
+  common::ObSpinLock refresh_scn_exempt_tx_lock_;
+  common::ObSEArray<int64_t, 4> refresh_scn_exempt_tx_ids_;
   int64_t total_tx_committed_;
   RunningMode running_mode_;           // IDLE: no async-index tables; ACTIVE: consuming logs.
   bool has_async_index_tables_;        // Cached result of check_has_async_index_tables_().
