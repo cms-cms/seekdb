@@ -285,7 +285,7 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 //   1. !has_async: return GTS — no async vector index tables.
 //   2. has_async && a committed tx is still in dispatcher: return OB_SUCCESS
 //      with invalid refresh_scn.
-//   3. has_async && current_lsn_.is_valid() && current_lsn_ >= max_lsn:
+//   3. has_async && current_lsn_.is_valid() && current_lsn_ >= end_lsn:
 //      return GTS — no pending logs to consume.
 //   4. otherwise (including invalid current_lsn_): return current_scn_ —
 //      still consuming logs / cannot prove caught-up.
@@ -313,9 +313,9 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
 
   // Case 2: a transaction blocks only after Fetcher has consumed its commit
   // log and handed it to Dispatcher.  A redo-only/open transaction cannot
-  // later commit below the GTS sampled above.  If its commit log already
-  // exists but has not been consumed, current_lsn_ remains behind max_lsn and
-  // case 4 below prevents this round from publishing that GTS.
+  // later commit below the GTS sampled above.  If its commit log is already
+  // readable but has not been consumed, current_lsn_ remains behind end_lsn
+  // and case 4 below prevents this round from publishing that GTS.
   bool has_blocking_tx = false;
   for (common::hash::ObHashMap<int64_t, ObCSTxInfo *>::const_iterator it = tx_info_.begin();
        !has_blocking_tx && it != tx_info_.end(); ++it) {
@@ -328,20 +328,24 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     return OB_SUCCESS;
   }
 
-  // Fetch max_lsn to distinguish case 3 and case 4.
-  palf::LSN max_lsn;
+  // Fetch the committed and flushed end LSN used by the log iterator.  Do not
+  // use max_lsn here: it is the allocator tail and may include an uncommitted
+  // log from the DDL transaction that is waiting for this refresh watermark.
+  // Comparing the iterator position with that tail would make the DDL wait on
+  // its own commit.
+  palf::LSN end_lsn;
   {
     storage::ObLS *ls = nullptr;
     if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::storage::ObLSService>()->get_ls(ls))
-        || OB_FAIL(ls->get_log_handler()->get_max_lsn(max_lsn))) {
+        || OB_FAIL(ls->get_log_handler()->get_end_lsn(end_lsn))) {
       return ret;
     }
   }
 
-  if (current_lsn_.is_valid() && current_lsn_ >= max_lsn) {
+  if (current_lsn_.is_valid() && current_lsn_ >= end_lsn) {
     // Case 3: caught up — no pending logs.  Publish the GTS sampled before
-    // max_lsn.  Sampling a newer GTS here would open a window in which a
-    // transaction can commit after max_lsn was read but still be covered by
+    // end_lsn.  Sampling a newer GTS here would open a window in which a
+    // transaction can commit after end_lsn was read but still be covered by
     // the published watermark before Fetcher consumes its commit log.
     refresh_scn = gts_scn;
   } else {
