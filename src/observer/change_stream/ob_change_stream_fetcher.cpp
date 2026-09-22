@@ -367,13 +367,14 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
   }
 
   // Case 2: committed DML handed to Dispatcher blocks until Worker commits.
-  // For redo-only user DML, consult the transaction table instead of treating
+  // For redo-only user DML, consult both the live transaction-context table
+  // and the durable transaction-data table instead of treating
   // commit_version_ == 0 as committed.  A transaction that is still RUNNING
   // after the GTS sampled above cannot later commit below that GTS, so it is
-  // safe for this refresh round and must not make FORK wait on its own open
-  // transaction.  A transaction already recorded as COMMIT must keep blocking
-  // until Fetcher consumes its commit log and Dispatcher applies the async
-  // index changes.  Unknown lookup results stay conservative and block.
+  // safe for this refresh round and must not make FORK wait behind the first
+  // async-index write.  A transaction already recorded as COMMIT must keep
+  // blocking until Fetcher consumes its commit log and Dispatcher applies the
+  // async-index changes.  Unknown lookup results stay conservative and block.
   bool has_blocking_tx = false;
   storage::ObLS *ls = nullptr;
   storage::ObTxTableGuard tx_table_guard;
@@ -394,9 +395,9 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     } else if (tx->has_user_dml_) {
       int64_t tx_state = storage::ObTxData::RUNNING;
       SCN trans_version;
-      SCN recycled_scn;
-      const int state_ret = tx_table_guard.try_get_tx_state(
-          transaction::ObTransID(tx->tx_id_), tx_state, trans_version, recycled_scn);
+      const int state_ret = tx_table_guard.get_tx_state_with_scn(
+          transaction::ObTransID(tx->tx_id_), SCN::max_scn(),
+          tx_state, trans_version);
       if (OB_SUCCESS == state_ret) {
         if (storage::ObTxData::RUNNING == tx_state
             || storage::ObTxData::ELR_COMMIT == tx_state
@@ -414,7 +415,7 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
         if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
           LOG_WARN("CSFetcher: failed to determine unresolved user DML state",
                    K(state_ret), K(tx->tx_id_), K(tx->start_lsn_),
-                   K(trans_version), K(recycled_scn));
+                   K(trans_version));
         }
       }
     }
@@ -434,12 +435,11 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
   }
 
   if (current_lsn_.is_valid() && current_lsn_ >= max_lsn) {
-    // Case 3: caught up — no pending logs, advance to GTS.
-    SCN gts_scn;
-    if (OB_FAIL(OB_TS_MGR.get_gts(gts_scn))) {
-    } else {
-      refresh_scn = gts_scn;
-    }
+    // Case 3: caught up — no pending logs.  Publish the GTS sampled before
+    // max_lsn.  Sampling a newer GTS here would open a window in which a
+    // transaction can commit after max_lsn was read but still be covered by
+    // the published watermark before Fetcher consumes its commit log.
+    refresh_scn = gts_scn;
   } else {
     // Case 4: still consuming logs, or current_lsn_ is invalid (e.g. restart init phase).
     // In both cases, be conservative and only advance to current_scn_.
