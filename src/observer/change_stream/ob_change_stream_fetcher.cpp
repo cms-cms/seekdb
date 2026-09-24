@@ -282,7 +282,9 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 
 // ---------------------------------------------------------------------------
 // get_refresh_scn: get GTS, then decide refresh_scn based on async-index state:
-//   1. !has_async: return GTS — no async vector index tables.
+//   1. !has_async: do not advance the watermark.  A future async-index table
+//      may become visible after a DML has already committed; advancing while
+//      idle could then make Dispatcher skip that first transaction.
 //   2. has_async && a committed tx is still in dispatcher: return OB_SUCCESS
 //      with invalid refresh_scn.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= end_lsn:
@@ -306,8 +308,12 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
   }
 
   if (!has_async) {
-    // Case 1: no async vector index tables — advance to GTS.
-    refresh_scn = gts_scn;
+    // Case 1: no async vector index tables.  Keep the last processed
+    // watermark instead of publishing GTS.  FORK only waits for this
+    // watermark after it has found an async index, and keeping the watermark
+    // conservative closes the IDLE -> ACTIVE schema-detection race: a DML
+    // committed for a newly-created async index must still be dispatched even
+    // if Fetcher notices the new schema a little later.
     return ret;
   }
 

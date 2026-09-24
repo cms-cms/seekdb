@@ -144,7 +144,8 @@ public:
   int get_min_dep_lsn(palf::LSN &min_lsn);
 
   /// For change_stream_refresh_scn:
-  /// - no async table: returns GTS
+  /// - no async table: returns invalid SCN so the last processed watermark is
+  ///   retained for a later IDLE -> ACTIVE transition
   /// - async table with a committed dispatched tx: returns invalid SCN (skip
   ///   this round); redo-only/open transactions cannot commit below the GTS
   ///   already sampled for this refresh round
