@@ -154,9 +154,11 @@ int ObCSExecutor::process_sub_task(ObCSExecSubTask *sub_task)
     for (int64_t i = 0; OB_SUCC(ret) && i < ctx->plugin_cnt_; ++i) {
       ObCSPlugin *plugin = ctx->plugins_[i];
       if (OB_NOT_NULL(plugin) && OB_FAIL(plugin->process(rows, *ctx))) {
-        LOG_WARN("change stream plugin process failed",
-                 KR(ret), K(i), K(executor_id_), K(ctx->batch_sn_),
-                 K(ctx->schema_version_), K(row_count));
+        // Keep the first product failure visible even when a failed batch is
+        // retried fast enough to rotate/rate-limit the normal diagnostic log.
+        FLOG_WARN("change stream plugin process failed",
+                  KR(ret), K(i), K(executor_id_), K(ctx->batch_sn_),
+                  K(ctx->schema_version_), K(row_count));
       }
     }
     if (OB_FAIL(ret)) {
