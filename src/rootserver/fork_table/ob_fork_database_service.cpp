@@ -63,7 +63,7 @@ int ObDDLService::fork_database(
     ObDDLSQLTransaction trans(schema_service_);
     const int64_t ddl_abs_timeout_us = THIS_WORKER.is_timeout_ts_valid()
         ? THIS_WORKER.get_timeout_ts()
-        : ObTimeUtility::current_time() + GCONF._ob_ddl_timeout;
+        : ObTimeUtility::current_time() + config::_ob_ddl_timeout();
     if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(
             schema_guard))) {
     } else if (OB_FAIL(schema_guard.get_schema_version(

@@ -271,7 +271,7 @@ int ObDDLService::fork_table(const obcall::ObForkTableArg &fork_table_arg,
     ObSEArray<const ObTableSchema*, 1> src_table_schemas;
     const int64_t ddl_abs_timeout_us = THIS_WORKER.is_timeout_ts_valid()
         ? THIS_WORKER.get_timeout_ts()
-        : ObTimeUtility::current_time() + GCONF._ob_ddl_timeout;
+        : ObTimeUtility::current_time() + config::_ob_ddl_timeout();
 
     if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(
             schema_guard))) {
