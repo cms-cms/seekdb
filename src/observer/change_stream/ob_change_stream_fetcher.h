@@ -145,8 +145,9 @@ public:
   int get_min_dep_lsn(palf::LSN &min_lsn);
 
   /// For change_stream_refresh_scn:
-  /// - no async table: returns invalid SCN so the last processed watermark is
-  ///   retained for a later IDLE -> ACTIVE transition
+  /// - no async table: returns the GTS sampled before checking the schema, so
+  ///   stale work for a dropped index can be retired without covering DML for
+  ///   an index created after that check
   /// - async table with an in-flight tx or committed dispatched tx: returns
   ///   invalid SCN (skip this round)
   /// - a FORK caller may temporarily exempt only its own non-DML transaction

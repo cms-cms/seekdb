@@ -288,9 +288,11 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 
 // ---------------------------------------------------------------------------
 // get_refresh_scn: get GTS, then decide refresh_scn based on async-index state:
-//   1. !has_async: do not advance the watermark.  A future async-index table
-//      may become visible after a DML has already committed; advancing while
-//      idle could then make Dispatcher skip that first transaction.
+//   1. !has_async: return the GTS sampled before the schema check.  Advancing
+//      to that horizon is safe because a DML for a newly-created async index
+//      cannot commit before the index schema is published, while the later
+//      schema check still observed that no async index existed.  It also lets
+//      Dispatcher retire work for an index that has since been dropped.
 //   2. has_async && a non-exempt tx is still in flight, or a committed tx is
 //      still in dispatcher: return OB_SUCCESS with invalid refresh_scn.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= end_lsn:
@@ -314,12 +316,12 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
   }
 
   if (!has_async) {
-    // Case 1: no async vector index tables.  Keep the last processed
-    // watermark instead of publishing GTS.  FORK only waits for this
-    // watermark after it has found an async index, and keeping the watermark
-    // conservative closes the IDLE -> ACTIVE schema-detection race: a DML
-    // committed for a newly-created async index must still be dispatched even
-    // if Fetcher notices the new schema a little later.
+    // Case 1: no async vector index tables.  The GTS was sampled before this
+    // schema check, so it cannot cover DML for an async index created after
+    // the check.  Publishing it is required to retire already-dispatched work
+    // for an index that has been dropped; retaining the old watermark would
+    // replay those stale transactions against a later schema indefinitely.
+    refresh_scn = gts_scn;
     return ret;
   }
 
