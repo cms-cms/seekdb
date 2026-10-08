@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX RS
 
+#include "config_bridge.h"
 #include "lib/time/ob_time_utility.h"
 #include "rootserver/ddl_task/ob_sys_ddl_util.h"
 #include "rootserver/fork_table/ob_fork_table_helper.h"
