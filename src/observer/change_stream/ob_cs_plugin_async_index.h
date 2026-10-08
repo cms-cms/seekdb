@@ -259,7 +259,8 @@ private:
   int init_schema_guard_();
 
   ObCSExecCtx &ctx_;
-  schema::ObSchemaGetterGuard schema_guard_;  // Per-thread; created in process().
+  schema::ObSchemaGetterGuard schema_guard_;         // Historical batch schema.
+  schema::ObSchemaGetterGuard latest_schema_guard_;  // Current schema for stale-work filtering.
   common::hash::ObHashMap<uint64_t, common::ObSEArray<ObCSVecIndexInfo, 4>> vec_index_cache_;
   common::hash::ObHashMap<uint64_t, uint64_t> tablet_to_table_;
 

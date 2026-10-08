@@ -179,7 +179,7 @@ private:
 
   int init_consumption_position_();
   void try_advance_min_dep_lsn_();
-  void try_advance_refresh_scn_();
+  void try_advance_refresh_scn_(const bool force = false);
   /// Check if any async vector index tables exist; returns OB_SUCCESS and sets has_async on success.
   int check_has_async_index_tables_(bool &has_async);
   /// Get has_async using cache (last_checked_schema_version_ / has_async_index_tables_).

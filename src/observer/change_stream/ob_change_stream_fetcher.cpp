@@ -533,25 +533,30 @@ void ObCSFetcher::try_advance_min_dep_lsn_()
   }
 }
 
-void ObCSFetcher::try_advance_refresh_scn_()
+void ObCSFetcher::try_advance_refresh_scn_(const bool force)
 {
-  if (!REACH_TIME_INTERVAL(CS_FETCHER_REFRESH_SCN_ADVANCE_INTERVAL_US)) {
+  if (!force && !REACH_TIME_INTERVAL(CS_FETCHER_REFRESH_SCN_ADVANCE_INTERVAL_US)) {
     return;
   }
   int ret = OB_SUCCESS;
   SCN refresh_scn;
+  int64_t affected_rows = 0;
   if (OB_FAIL(get_refresh_scn(refresh_scn))) {
     return;
   }
   if (refresh_scn.is_valid()) {
-    if (OB_ISNULL(dispatcher_)) {
+    if (OB_ISNULL(dispatcher_) || OB_ISNULL(GCTX.sql_proxy_)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (IDLE == running_mode_
+               && OB_FAIL(ObGlobalStatProxy::advance_change_stream_refresh_scn(
+                      *GCTX.sql_proxy_, refresh_scn, affected_rows))) {
     } else if (OB_FAIL(dispatcher_->update_refresh_scn(
                    static_cast<int64_t>(refresh_scn.get_val_for_gts())))) {
     } else if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
       LOG_INFO("CSFetcher: refresh_scn advanced",
                "mode", running_mode_ == ACTIVE ? "ACTIVE" : "IDLE",
-               K(refresh_scn), "inflight_tx_count", tx_info_.size());
+               K(refresh_scn), K(affected_rows),
+               "inflight_tx_count", tx_info_.size());
     }
   }
 }
@@ -869,6 +874,14 @@ void ObCSFetcher::run1()
             }
           }
           running_mode_ = new_mode;
+          if (IDLE == running_mode_) {
+            // The IDLE window can be shorter than the periodic refresh interval
+            // (for example, consecutive embedded tests can drop one async index
+            // and create the next almost immediately).  Persist the safe horizon
+            // at the transition so a later process never replays work for the
+            // dropped index against a newer schema.
+            try_advance_refresh_scn_(true /* force */);
+          }
           if (ACTIVE == running_mode_) {
             iter_ready = false;
           }
