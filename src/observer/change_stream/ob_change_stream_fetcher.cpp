@@ -57,6 +57,8 @@ ObCSFetcher::ObCSFetcher()
     current_scn_(),
     current_schema_version_(0),
     tx_info_(),
+    refresh_scn_exempt_tx_lock_(),
+    refresh_scn_exempt_tx_ids_(),
     total_tx_committed_(0),
     running_mode_(IDLE),
     has_async_index_tables_(false),
@@ -210,6 +212,10 @@ void ObCSFetcher::destroy()
       }
     }
     tx_info_.destroy();
+    {
+      common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+      refresh_scn_exempt_tx_ids_.reset();
+    }
     dispatcher_ = nullptr;
     log_storage_ = nullptr;
     schema_publish_signal_ = nullptr;
@@ -285,8 +291,8 @@ int ObCSFetcher::get_min_dep_lsn(palf::LSN &min_lsn)
 //   1. !has_async: do not advance the watermark.  A future async-index table
 //      may become visible after a DML has already committed; advancing while
 //      idle could then make Dispatcher skip that first transaction.
-//   2. has_async && a committed tx is still in dispatcher: return OB_SUCCESS
-//      with invalid refresh_scn.
+//   2. has_async && a non-exempt tx is still in flight, or a committed tx is
+//      still in dispatcher: return OB_SUCCESS with invalid refresh_scn.
 //   3. has_async && current_lsn_.is_valid() && current_lsn_ >= end_lsn:
 //      return GTS — no pending logs to consume.
 //   4. otherwise (including invalid current_lsn_): return current_scn_ —
@@ -317,16 +323,18 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     return ret;
   }
 
-  // Case 2: a transaction blocks only after Fetcher has consumed its commit
-  // log and handed it to Dispatcher.  A redo-only/open transaction cannot
-  // later commit below the GTS sampled above.  If its commit log is already
-  // readable but has not been consumed, current_lsn_ remains behind end_lsn
-  // and case 4 below prevents this round from publishing that GTS.
+  // Case 2: remain conservative for every in-flight transaction.  A
+  // transaction may already have chosen a commit version before its commit
+  // log becomes readable, so commit_version_ == 0 in Fetcher does not prove
+  // that publishing the sampled GTS is safe.  The only exception is the exact
+  // FORK transaction registered by wait_refresh_scn(): that caller is still
+  // inside the wait, so it cannot enter commit before the exemption is
+  // removed, and its commit version must therefore be newer than gts_scn.
   bool has_blocking_tx = false;
   for (common::hash::ObHashMap<int64_t, ObCSTxInfo *>::const_iterator it = tx_info_.begin();
        !has_blocking_tx && it != tx_info_.end(); ++it) {
     const ObCSTxInfo *tx = it->second;
-    if (OB_NOT_NULL(tx) && tx->commit_version_ > 0) {
+    if (OB_NOT_NULL(tx) && !is_refresh_scn_exempt_tx_(tx->tx_id_)) {
       has_blocking_tx = true;
     }
   }
@@ -360,6 +368,52 @@ int ObCSFetcher::get_refresh_scn(SCN &refresh_scn)
     refresh_scn = current_scn_;
   }
   return ret;
+}
+
+int ObCSFetcher::add_refresh_scn_exempt_tx(const int64_t tx_id)
+{
+  int ret = OB_SUCCESS;
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  bool found = false;
+  if (tx_id <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (int64_t i = 0; !found && i < refresh_scn_exempt_tx_ids_.count(); ++i) {
+      found = refresh_scn_exempt_tx_ids_.at(i) == tx_id;
+    }
+    if (!found && OB_FAIL(refresh_scn_exempt_tx_ids_.push_back(tx_id))) {
+      LOG_WARN("CSFetcher: failed to register refresh scn exempt transaction",
+               KR(ret), K(tx_id));
+    }
+  }
+  return ret;
+}
+
+int ObCSFetcher::remove_refresh_scn_exempt_tx(const int64_t tx_id)
+{
+  int ret = OB_SUCCESS;
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  bool found = false;
+  for (int64_t i = 0; !found && i < refresh_scn_exempt_tx_ids_.count(); ++i) {
+    if (refresh_scn_exempt_tx_ids_.at(i) == tx_id) {
+      found = true;
+      ret = refresh_scn_exempt_tx_ids_.remove(i);
+    }
+  }
+  if (!found) {
+    ret = OB_ENTRY_NOT_EXIST;
+  }
+  return ret;
+}
+
+bool ObCSFetcher::is_refresh_scn_exempt_tx_(const int64_t tx_id)
+{
+  common::ObSpinLockGuard guard(refresh_scn_exempt_tx_lock_);
+  bool found = false;
+  for (int64_t i = 0; !found && i < refresh_scn_exempt_tx_ids_.count(); ++i) {
+    found = refresh_scn_exempt_tx_ids_.at(i) == tx_id;
+  }
+  return found;
 }
 
 // get_has_async_cached_: use last_checked_schema_version_ / has_async_index_tables_; refresh cache when schema version changed.
