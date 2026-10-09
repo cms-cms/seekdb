@@ -70,7 +70,21 @@ ObCSAsyncIndexProcessor::ObCSAsyncIndexProcessor(ObCSExecCtx &ctx)
 {
 }
 
-int ObCSAsyncIndexProcessor::init_schema_guard_()
+int ObCSAsyncIndexProcessor::init_latest_schema_guard_()
+{
+  int ret = common::OB_SUCCESS;
+  ObMultiVersionSchemaService *schema_service =
+      nullptr != ::oceanbase::share::server_service<::oceanbase::share::schema::ObSchemaRuntimeService>()
+          ? ::oceanbase::share::server_service<::oceanbase::share::schema::ObSchemaRuntimeService>()->get_schema_service()
+          : nullptr;
+  if (OB_ISNULL(schema_service)) {
+    ret = common::OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_service->get_runtime_schema_guard(latest_schema_guard_))) {
+  }
+  return ret;
+}
+
+int ObCSAsyncIndexProcessor::init_historical_schema_guard_()
 {
   int ret = common::OB_SUCCESS;
   ObMultiVersionSchemaService *schema_service =
@@ -82,7 +96,56 @@ int ObCSAsyncIndexProcessor::init_schema_guard_()
   } else if (OB_FAIL(schema_service->get_runtime_schema_guard(
       schema_guard_, ctx_.schema_version_,
       ObMultiVersionSchemaService::RefreshSchemaMode::FORCE_FALLBACK))) {
-  } else if (OB_FAIL(schema_service->get_runtime_schema_guard(latest_schema_guard_))) {
+  }
+  return ret;
+}
+
+int ObCSAsyncIndexProcessor::has_live_async_index_target_(
+    const common::ObIArray<ObCSRow> &rows,
+    bool &has_live_target)
+{
+  int ret = common::OB_SUCCESS;
+  has_live_target = false;
+  common::ObSEArray<uint64_t, 16> checked_table_ids;
+
+  for (int64_t i = 0; OB_SUCC(ret) && !has_live_target && i < rows.count(); ++i) {
+    uint64_t table_id = common::OB_INVALID_ID;
+    if (OB_FAIL(resolve_table_id_from_tablet_id_(rows.at(i).tablet_id_, table_id))) {
+      if (common::OB_TABLET_NOT_EXIST == ret) {
+        ret = common::OB_SUCCESS;
+      }
+    } else if (common::OB_INVALID_ID == table_id) {
+    } else {
+      bool checked = false;
+      for (int64_t j = 0; !checked && j < checked_table_ids.count(); ++j) {
+        checked = checked_table_ids.at(j) == table_id;
+      }
+      if (!checked && OB_FAIL(checked_table_ids.push_back(table_id))) {
+      } else if (!checked) {
+        const schema::ObTableSchema *data_table_schema = nullptr;
+        if (OB_FAIL(latest_schema_guard_.get_table_schema(table_id, data_table_schema))) {
+        } else if (OB_ISNULL(data_table_schema)
+                   || !data_table_schema->is_user_table()
+                   || !data_table_schema->is_heap_organized_table()) {
+        } else {
+          common::ObSEArray<schema::ObAuxTableMetaInfo, 16> simple_index_infos;
+          if (OB_FAIL(data_table_schema->get_simple_index_infos(simple_index_infos))) {
+          } else {
+            for (int64_t j = 0;
+                 OB_SUCC(ret) && !has_live_target && j < simple_index_infos.count(); ++j) {
+              const schema::ObTableSchema *index_schema = nullptr;
+              if (OB_FAIL(latest_schema_guard_.get_table_schema(
+                      simple_index_infos.at(j).table_id_, index_schema))) {
+              } else if (OB_NOT_NULL(index_schema)
+                         && index_schema->get_data_table_id() == table_id
+                         && schema::is_vec_index_id_type(index_schema->get_index_type())) {
+                has_live_target = true;
+              }
+            }
+          }
+        }
+      }
+    }
   }
   return ret;
 }
@@ -119,11 +182,18 @@ int ObCSAsyncIndexProcessor::get_or_cache_vec_index_info_(
 int ObCSAsyncIndexProcessor::process(common::ObIArray<ObCSRow> &rows)
 {
   int ret = common::OB_SUCCESS;
+  bool has_live_target = false;
   if (rows.count() == 0) {
     // nothing to process
   } else if (!vec_index_cache_.created() && OB_FAIL(vec_index_cache_.create(64, "CSAsyncIdxCa"))) {
   } else if (!tablet_to_table_.created() && OB_FAIL(tablet_to_table_.create(64, "CSTabletToTb"))) {
-  } else if (OB_FAIL(init_schema_guard_())) {
+  } else if (OB_FAIL(init_latest_schema_guard_())) {
+  } else if (OB_FAIL(has_live_async_index_target_(rows, has_live_target))) {
+  } else if (!has_live_target) {
+    // Every row belongs to a dropped table/index (or to a table that never had
+    // a live async vector target).  Retire the stale redo without requiring an
+    // old schema version that may already have been recycled.
+  } else if (OB_FAIL(init_historical_schema_guard_())) {
   } else {
     common::ObSEArray<TabletEventGroup, 16> groups;
     common::hash::ObHashMap<GroupKey, int64_t, common::hash::NoPthreadDefendMode> key_to_group;

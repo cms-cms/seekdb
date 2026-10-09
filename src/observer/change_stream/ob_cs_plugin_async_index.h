@@ -256,7 +256,10 @@ private:
   int write_to_vsag_(const common::ObIArray<ObASyncIndexEvent> &events,
       const ObCSVecIndexInfo &vec_info);
 
-  int init_schema_guard_();
+  int init_latest_schema_guard_();
+  int init_historical_schema_guard_();
+  int has_live_async_index_target_(
+      const common::ObIArray<ObCSRow> &rows, bool &has_live_target);
 
   ObCSExecCtx &ctx_;
   schema::ObSchemaGetterGuard schema_guard_;         // Historical batch schema.
