@@ -539,9 +539,16 @@ int ObCSDispatcher::do_dispatch_()
     exec_ctx->task_count_ = total_subtask_cnt;
     ATOMIC_INC(&active_batch_count_);
 
+    // All subtasks in one batch share the same transaction and plugin
+    // instances, so they must execute serially.  Pin the whole batch to one
+    // single-threaded executor instead of making every CPU worker contend on
+    // exec_ctx->process_lock_.  Hashing by batch keeps independent batches
+    // distributed across executors without introducing intra-batch races.
+    const int64_t batch_executor_id = exec_ctx->batch_sn_ % executor_count;
     int64_t pushed = 0;
     for (int64_t i = 0; i < total_subtask_cnt; ++i) {
-      if (OB_FAIL(mgr->get_worker().push_subtask(i, &exec_ctx->sub_tasks_.at(i)))) {
+      if (OB_FAIL(mgr->get_worker().push_subtask(
+              batch_executor_id, &exec_ctx->sub_tasks_.at(i)))) {
         break;
       }
       pushed++;
@@ -551,7 +558,8 @@ int ObCSDispatcher::do_dispatch_()
       batch_in_flight = true;
     }
 
-    LOG_INFO("CSDispatcher: subtasks pushed to workers", K(pushed), K(total_subtask_cnt));
+    LOG_INFO("CSDispatcher: subtasks pushed to worker",
+             K(pushed), K(total_subtask_cnt), K(batch_executor_id));
 
     const int64_t unpushed = total_subtask_cnt - pushed;
     if (unpushed > 0) {
