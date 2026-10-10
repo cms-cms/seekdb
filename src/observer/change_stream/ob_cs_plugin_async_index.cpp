@@ -100,6 +100,52 @@ int ObCSAsyncIndexProcessor::init_historical_schema_guard_()
   return ret;
 }
 
+int ObCSAsyncIndexProcessor::check_live_async_index_target_(
+    const schema::ObTableSchema &data_table_schema,
+    const schema::ObTableSchema &index_schema,
+    bool &is_live_target)
+{
+  int ret = common::OB_SUCCESS;
+  is_live_target = false;
+
+  if (!data_table_schema.is_user_table()
+      || !data_table_schema.is_heap_organized_table()
+      || index_schema.get_data_table_id() != data_table_schema.get_table_id()
+      || !schema::is_vec_index_id_type(index_schema.get_index_type())) {
+  } else {
+    const ObString index_params_str = index_schema.get_index_params();
+    const bool is_async_mode = is_vector_index_sync_mode_async(
+        index_params_str, true /*is_hnsw_heap_table*/);
+    common::ObSEArray<uint64_t, 1> vec_col_ids;
+    bool is_semantic_index = false;
+    if (!is_async_mode) {
+    } else if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_id(
+                   data_table_schema, index_schema, vec_col_ids))) {
+    } else if (vec_col_ids.count() <= 0) {
+      ret = common::OB_ERR_UNEXPECTED;
+    } else if (!index_params_str.empty()) {
+      const ObColumnSchemaV2 *data_col_schema =
+          data_table_schema.get_column_schema(vec_col_ids.at(0));
+      if (OB_ISNULL(data_col_schema)) {
+        ret = common::OB_ERR_UNEXPECTED;
+      } else if (ob_is_varchar_type(data_col_schema->get_data_type(),
+                                    data_col_schema->get_collation_type())) {
+        ObVectorIndexParam param;
+        const int tmp_ret = ObVectorIndexUtil::parser_params_from_string(
+            index_params_str, ObVectorIndexType::VIT_HNSW_INDEX,
+            param, false /*set_default*/);
+        if (OB_SUCCESS == tmp_ret) {
+          is_semantic_index = (param.endpoint_[0] != '\0' && param.dim_ > 0);
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_live_target = is_async_mode && !is_semantic_index;
+    }
+  }
+  return ret;
+}
+
 int ObCSAsyncIndexProcessor::has_live_async_index_target_(
     const common::ObIArray<ObCSRow> &rows,
     bool &has_live_target)
@@ -136,10 +182,13 @@ int ObCSAsyncIndexProcessor::has_live_async_index_target_(
               const schema::ObTableSchema *index_schema = nullptr;
               if (OB_FAIL(latest_schema_guard_.get_table_schema(
                       simple_index_infos.at(j).table_id_, index_schema))) {
-              } else if (OB_NOT_NULL(index_schema)
-                         && index_schema->get_data_table_id() == table_id
-                         && schema::is_vec_index_id_type(index_schema->get_index_type())) {
-                has_live_target = true;
+              } else if (OB_NOT_NULL(index_schema)) {
+                bool is_live_target = false;
+                if (OB_FAIL(check_live_async_index_target_(
+                        *data_table_schema, *index_schema, is_live_target))) {
+                } else if (is_live_target) {
+                  has_live_target = true;
+                }
               }
             }
           }
