@@ -24,6 +24,7 @@
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/resolver/ob_stmt_resolver.h"
 #include "sql/engine/expr/ob_expr_column_conv.h"
+#include "sql/engine/cmd/ob_variable_set_executor.h"
 #include "sql/engine/expr/ob_expr_pl_integer_checker.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "sql/pl/ob_pl_package.h"
@@ -1276,7 +1277,18 @@ int ObSPIService::spi_set_variable(ObPLExecCtx *ctx,
             scope = static_cast<ObSetVar::SetScopeType>(expr->get_expr_items().at(2).get_obj().get_int());
           }
         }
-        if (OB_SUCC(ret) && OB_FAIL(set_variable(ctx, scope, name, *value, is_default))) {
+        if (OB_FAIL(ret)) {
+        } else if (T_OP_GET_USER_VAR == expr_type && !is_default && value->is_geometry()) {
+          // Geometry values carry an internal SWKB version byte.  Replaying
+          // print_sql_literal() as SET @var = X'...' exposes that byte as user
+          // data; store the typed value through the same boundary as SELECT INTO.
+          ObSQLSessionInfo *session = nullptr;
+          if (OB_ISNULL(ctx->exec_ctx_)
+              || OB_ISNULL(session = ctx->exec_ctx_->get_my_session())) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(ObVariableSetExecutor::set_user_variable(*value, name, session))) {
+          }
+        } else if (OB_FAIL(set_variable(ctx, scope, name, *value, is_default))) {
         }
       }
     } else if (T_OP_GET_PACKAGE_VAR == expr_type) {

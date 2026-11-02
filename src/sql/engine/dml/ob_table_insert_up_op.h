@@ -195,6 +195,10 @@ protected:
   int do_insert(const ObConflictValue &constraint_value);
 
   int do_update_with_ignore();
+  int reconcile_ignore_update_row_count(int64_t insert_rows_before,
+                                        int64_t upd_changed_rows_before,
+                                        int64_t upd_found_rows_before,
+                                        int64_t upd_affected_rows_before);
   // Submit all current das tasks;
   int post_all_dml_das_task(ObDMLRtCtx &das_ctx);
   int post_all_try_insert_das_task(ObDMLRtCtx &dml_rtctx);

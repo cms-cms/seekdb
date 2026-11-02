@@ -863,6 +863,11 @@ int ObTableInsertUpOp::do_insert_up()
   int64_t last_stmt_insert_id = 0;
   while (OB_SUCC(ret) && !is_iter_end) {
     int64_t insert_rows = 0;
+    const int64_t insert_rows_before = insert_rows_;
+    const int64_t upd_changed_rows_before = upd_changed_rows_;
+    ObUpdRtDef &primary_upd_rtdef = insert_up_rtdefs_.at(0).upd_rtdef_;
+    const int64_t upd_found_rows_before = primary_upd_rtdef.found_rows_;
+    const int64_t upd_affected_rows_before = primary_upd_rtdef.dupd_rtdef_.affected_rows_;
     bool has_record_last_insert_id = false;
     transaction::ObTxSEQ savepoint_no;
     // must set conflict_row fetch flag
@@ -883,12 +888,61 @@ int ObTableInsertUpOp::do_insert_up()
     } else if (OB_FAIL(do_insert_up_cache())) {
     } else if (!is_ignore_ && OB_FAIL(prepare_final_insert_up_task())) {
     } else if (OB_FAIL(post_all_dml_das_task(upd_rtctx_))) {
+    } else if (is_ignore_ && OB_FAIL(reconcile_ignore_update_row_count(insert_rows_before,
+                                                                      upd_changed_rows_before,
+                                                                      upd_found_rows_before,
+                                                                      upd_affected_rows_before))) {
     } else if (OB_FAIL(ObDMLService::handle_after_row_processing(this, &dml_modify_rows_))) {
     }
     if (OB_SUCC(ret) && !is_iter_end) {
       // Only need to do reuse if there is a next batch, if there is no next batch, memory will be released in close and destroy
       // The previous logic executed successfully, this batch successfully completed replace, reuse environment, prepare for the next batch
       if (OB_FAIL(reuse())) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableInsertUpOp::reconcile_ignore_update_row_count(int64_t insert_rows_before,
+                                                         int64_t upd_changed_rows_before,
+                                                         int64_t upd_found_rows_before,
+                                                         int64_t upd_affected_rows_before)
+{
+  int ret = OB_SUCCESS;
+  ObUpdRtDef &upd_rtdef = insert_up_rtdefs_.at(0).upd_rtdef_;
+  // is_row_changed_ describes the candidate update.  With IGNORE, DAS can
+  // still roll that update back on another unique-key conflict, so only the
+  // storage affected-row delta is allowed to contribute to the final count.
+  const int64_t candidate_changed_rows = upd_changed_rows_ - upd_changed_rows_before;
+  const int64_t actual_changed_rows = upd_rtdef.dupd_rtdef_.affected_rows_ - upd_affected_rows_before;
+  const int64_t ignored_changed_rows = candidate_changed_rows - actual_changed_rows;
+  if (OB_UNLIKELY(candidate_changed_rows < 0
+                  || actual_changed_rows < 0
+                  || ignored_changed_rows < 0
+                  || insert_rows_ - insert_rows_before < ignored_changed_rows
+                  || upd_rtdef.found_rows_ - upd_found_rows_before < ignored_changed_rows)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid insert on duplicate key update ignore row count",
+             K(ret), K(candidate_changed_rows), K(actual_changed_rows),
+             K(ignored_changed_rows), K(insert_rows_before), K(insert_rows_),
+             K(upd_changed_rows_before), K(upd_changed_rows_),
+             K(upd_found_rows_before), K(upd_rtdef.found_rows_),
+             K(upd_affected_rows_before), K(upd_rtdef.dupd_rtdef_.affected_rows_));
+  } else if (ignored_changed_rows > 0) {
+    insert_rows_ -= ignored_changed_rows;
+    upd_changed_rows_ -= ignored_changed_rows;
+    upd_rtdef.found_rows_ -= ignored_changed_rows;
+    const int64_t insert_rows = insert_rows_ - insert_rows_before;
+    const int64_t update_rows = upd_changed_rows_ - upd_changed_rows_before;
+    const int64_t found_rows = upd_rtdef.found_rows_ - upd_found_rows_before;
+    ObSQLSessionInfo *session = GET_MY_SESSION(ctx_);
+    if (OB_ISNULL(session)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const int64_t affected_rows = session->get_capability().cap_flags_.OB_CLIENT_FOUND_ROWS
+          ? insert_rows + found_rows : insert_rows + update_rows;
+      if (OB_FAIL(replace_implict_cursor(affected_rows, found_rows, 0, update_rows))) {
       }
     }
   }
